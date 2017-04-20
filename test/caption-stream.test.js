@@ -28,7 +28,7 @@ var makeSeiFromCaptionPacket = function(caption) {
       0xc1, // process_cc_data, cc_count
       0xff, // reserved
       // 1111 1100
-      0xfc, // cc_valid, cc_type (608, field 1)
+      (0xfc | caption.type), // cc_valid, cc_type (608, field 1)
       (caption.ccData & 0xff00) >> 8, // cc_data_1
       caption.ccData & 0xff, // cc_data_2 without parity bit set
 
@@ -58,6 +58,7 @@ QUnit.test('parses SEIs messages larger than 255 bytes', function() {
   captionStream.ccStreams_[0].push = function(packet) {
     packets.push(packet);
   };
+  captionStream.activeStreams_ = [captionStream.ccStreams_[0]];
   data = new Uint8Array(268);
   data[0] = 0x04; // payload_type === user_data_registered_itu_t_t35
   data[1] = 0xff; // payload_size
@@ -91,6 +92,7 @@ QUnit.test('parses SEIs containing multiple messages', function() {
   captionStream.ccStreams_[0].push = function(packet) {
     packets.push(packet);
   };
+  captionStream.activeStreams_ = [captionStream.ccStreams_[0]];
 
   data = new Uint8Array(22);
   data[0] = 0x01; // payload_type !== user_data_registered_itu_t_t35
@@ -140,6 +142,7 @@ QUnit.test('parses a minimal example of caption data', function() {
   captionStream.ccStreams_[0].push = function(packet) {
     packets.push(packet);
   };
+  captionStream.activeStreams_ = [captionStream.ccStreams_[0]];
   captionStream.push({
     nalUnitType: 'sei_rbsp',
     escapedRBSP: new Uint8Array([
@@ -197,6 +200,8 @@ QUnit.test('sorting is fun', function() {
   packets = [
     // Send another command so that the second EOC isn't ignored
     { pts: 10 * 1000, ccData: 0x1420, type: 0 },
+    // RCL, resume caption loading
+    { pts: 1000, ccData: 0x1420, type: 0 },
     // 'test string #1'
     { pts: 1000, ccData: characters('te'), type: 0 },
     { pts: 1000, ccData: characters('st'), type: 0 },
@@ -205,8 +210,6 @@ QUnit.test('sorting is fun', function() {
     { pts: 10 * 1000, ccData: characters('te'), type: 0 },
     { pts: 10 * 1000, ccData: characters('st'), type: 0 },
     { pts: 10 * 1000, ccData: characters(' s'), type: 0 },
-    // RCL, resume caption loading
-    { pts: 1000, ccData: 0x1420, type: 0 },
     // 'test string #1' continued
     { pts: 1000, ccData: characters('tr'), type: 0 },
     { pts: 1000, ccData: characters('in'), type: 0 },
@@ -240,6 +243,85 @@ QUnit.test('sorting is fun', function() {
   QUnit.equal(captions.length, 2, 'detected two captions');
   QUnit.equal(captions[0].text, 'test string #1', 'parsed caption 1');
   QUnit.equal(captions[1].text, 'test string #2', 'parsed caption 2');
+});
+
+QUnit.test('extracts all theoretical caption channels', function() {
+  var captions = [];
+  captionStream.ccStreams_.forEach(function(cc) {
+    cc.on('data', function(caption) {
+      captions.push(caption);
+    });
+  });
+
+  var packets = [
+    { pts: 1000, type: 0, ccData: 0x1425 },
+    { pts: 2000, type: 0, ccData: characters('1a') },
+    { pts: 3000, type: 0, ccData: 0x1c25 },
+    { pts: 4000, type: 1, ccData: 0x1d25 },
+    { pts: 5000, type: 1, ccData: characters('4a') },
+    { pts: 6000, type: 0, ccData: characters('2a') },
+    { pts: 7000, type: 1, ccData: characters('4b') },
+    { pts: 8000, type: 1, ccData: 0x1525 },
+    { pts: 9000, type: 1, ccData: characters('3a') },
+    { pts: 10000, type: 0, ccData: 0x142d },
+    { pts: 11000, type: 0, ccData: 0x1c2d },
+    { pts: 12000, type: 0, ccData: 0x1425 },
+    { pts: 13000, type: 0, ccData: characters('1b') },
+    { pts: 14000, type: 0, ccData: characters('1c') },
+    { pts: 15000, type: 0, ccData: 0x142d },
+    { pts: 16000, type: 1, ccData: 0x152d },
+    { pts: 17000, type: 1, ccData: 0x1d2d },
+    { pts: 18000, type: 0, ccData: characters('2b') },
+    { pts: 19000, type: 0, ccData: 0x1c2d }
+  ];
+
+  var seiNals = packets.map(makeSeiFromCaptionPacket);
+  seiNals.forEach(captionStream.push, captionStream);
+  captionStream.flush();
+
+  QUnit.equal(captions.length, 6, 'got all captions');
+  QUnit.equal(captions[0].text, '1a', 'cc1 first row');
+  QUnit.equal(captions[1].text, '2a', 'cc2 first row');
+  QUnit.equal(captions[2].text, '1a\n1b1c', 'cc1 first and second row');
+  QUnit.equal(captions[3].text, '3a', 'cc3 first row');
+  QUnit.equal(captions[4].text, '4a4b', 'cc4 first row');
+  QUnit.equal(captions[5].text, '2a\n2b', 'cc2 first and second row');
+
+});
+
+QUnit.test('drops data until first command that sets activeChannel', function() {
+  var captions = [];
+  captionStream.ccStreams_.forEach(function(cc) {
+    cc.on('data', function(caption) {
+      captions.push(caption);
+    });
+  });
+
+  var packets = [
+    { pts: 0 * 1000, ccData: characters('no'), type: 0 },
+    { pts: 0 * 1000, ccData: characters('t '), type: 0 },
+    { pts: 0 * 1000, ccData: characters('th'), type: 0 },
+    { pts: 0 * 1000, ccData: characters('is'), type: 0 },
+    { pts: 1 * 1000, ccData: 0x142f, type: 0 },
+    { pts: 1 * 1000, ccData: 0x1420, type: 0 },
+    { pts: 2 * 1000, ccData: 0x142f, type: 0 },
+    // RCL, resume caption loading
+    { pts: 3 * 1000, ccData: 0x1420, type: 0 },
+    { pts: 3 * 1000, ccData: 0x142e, type: 0 },
+    { pts: 4 * 1000, ccData: characters('te'), type: 0 },
+    { pts: 4 * 1000, ccData: characters('st'), type: 0 },
+    { pts: 5 * 1000, ccData: 0x142f, type: 0 },
+    { pts: 5 * 1000, ccData: 0x1420, type: 0 },
+    { pts: 6 * 1000, ccData: 0x142f, type: 0 }
+  ];
+
+  var seiNals = packets.map(makeSeiFromCaptionPacket);
+  seiNals.forEach(captionStream.push, captionStream);
+  captionStream.flush();
+
+  QUnit.equal(captions.length, 1, 'caption 1 dropped');
+  QUnit.equal(captions[0].text, 'test', 'caption with ambiguous channel dropped');
+  QUnit.equal(captions[0].stream, 'CC1', 'caption went to right channel');
 });
 
 var cea608Stream;
@@ -1100,57 +1182,6 @@ QUnit.test('preserves newlines from PACs in pop-on mode', function() {
 
   QUnit.equal(captions.length, 1, 'caption emitted');
   QUnit.equal(captions[0].text, 'TEST\n\nSTRING\nDATA', 'Position PACs were converted to newlines');
-});
-
-QUnit.test('extracts all theoretical caption channels', function() {
-  var cea608Stream1 = cea608Stream;
-  var cea608Stream2 = new m2ts.Cea608Stream(0, 1);
-  var cea608Stream3 = new m2ts.Cea608Stream(1, 0);
-  var cea608Stream4 = new m2ts.Cea608Stream(1, 1);
-  var captions = [];
-  [cea608Stream1, cea608Stream2, cea608Stream3, cea608Stream4].forEach(function(cc) {
-    cc.on('data', function(caption) {
-      captions.push(caption);
-    });
-  });
-
-  var packets = [
-    { type: 0, ccData: 0x1425 },
-    { type: 0, ccData: characters('1a') },
-    { type: 0, ccData: 0x1c25 },
-    { type: 1, ccData: 0x1d25 },
-    { type: 1, ccData: characters('4a') },
-    { type: 0, ccData: characters('2a') },
-    { type: 1, ccData: characters('4b') },
-    { type: 1, ccData: 0x1525 },
-    { type: 1, ccData: characters('3a') },
-    { type: 0, ccData: 0x142d },
-    { type: 0, ccData: 0x1c2d },
-    { type: 0, ccData: 0x1425 },
-    { type: 0, ccData: characters('1b') },
-    { type: 0, ccData: characters('1c') },
-    { type: 0, ccData: 0x142d },
-    { type: 1, ccData: 0x152d },
-    { type: 1, ccData: 0x1d2d },
-    { type: 0, ccData: characters('2b') },
-    { type: 0, ccData: 0x1c2d }
-  ];
-
-  packets.forEach(function(packet) {
-    cea608Stream1.push(packet);
-    cea608Stream2.push(packet);
-    cea608Stream3.push(packet);
-    cea608Stream4.push(packet);
-  });
-
-  QUnit.equal(captions.length, 6, 'got all captions');
-  QUnit.equal(captions[0].text, '1a', 'cc1 first row');
-  QUnit.equal(captions[1].text, '2a', 'cc2 first row');
-  QUnit.equal(captions[2].text, '1a\n1b1c', 'cc1 first and second row');
-  QUnit.equal(captions[3].text, '3a', 'cc3 first row');
-  QUnit.equal(captions[4].text, '4a4b', 'cc4 first row');
-  QUnit.equal(captions[5].text, '2a\n2b', 'cc2 first and second row');
-
 });
 
 QUnit.test('extracts real-world cc1 and cc3 channels', function() {
